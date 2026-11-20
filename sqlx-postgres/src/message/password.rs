@@ -44,6 +44,21 @@ fn md5_password_hash(password: &str, username: &str, salt: &[u8; 4]) -> Result<S
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Neither backend feature is active. This compiles so the crate still
+/// builds in contexts where no consumer forwards a backend choice (e.g.
+/// Cargo's host-only feature-unification bucket for a proc-macro crate's
+/// own dependency, such as sqlx-macros-core's `sqlx-postgres` -- compiled
+/// only to generate code at macro-expansion time, never linked into a
+/// shipped binary, so this arm is unreachable in practice for a consumer
+/// that, like `sqlx` itself here, forwards one of the two features for
+/// its real target build).
+#[cfg(not(any(feature = "openssl", feature = "md5-rust-crypto")))]
+fn md5_password_hash(_password: &str, _username: &str, _salt: &[u8; 4]) -> Result<String, Error> {
+    Err(Error::Configuration(
+        "postgres md5 password authentication requires the `openssl` or `md5-rust-crypto` feature".into(),
+    ))
+}
+
 #[derive(Debug)]
 pub enum Password<'a> {
     Cleartext(&'a str),
