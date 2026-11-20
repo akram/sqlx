@@ -1,8 +1,48 @@
 use crate::io::BufMutExt;
 use crate::message::{FrontendMessage, FrontendMessageFormat};
-use md5::{Digest, Md5};
 use sqlx_core::Error;
 use std::num::Saturating;
+
+/// `concat('md5', md5(concat(md5(concat(password, username)), random-salt)))`,
+/// per the PostgreSQL wire protocol's legacy `md5` password-authentication
+/// method (the `md5()` SQL function returns its result as a hex string).
+///
+/// MD5 password hashing should really be phased out in favor of
+/// SCRAM-SHA-256, but it's still a protocol-mandated option, so it stays
+/// backend-selectable like every other primitive in this driver: `openssl`
+/// below routes it through system OpenSSL instead of the RustCrypto `md-5`
+/// crate, for environments that require all cryptographic operations to go
+/// through a FIPS-certifiable OpenSSL build.
+#[cfg(feature = "openssl")]
+fn md5_password_hash(password: &str, username: &str, salt: &[u8; 4]) -> Result<String, Error> {
+    use openssl::hash::{hash, MessageDigest};
+
+    let map_err = |e: openssl::error::ErrorStack| Error::Protocol(format!("md5 hash failed: {e}"));
+
+    let mut first = Vec::with_capacity(password.len() + username.len());
+    first.extend_from_slice(password.as_bytes());
+    first.extend_from_slice(username.as_bytes());
+    let first_hex = hex::encode(hash(MessageDigest::md5(), &first).map_err(map_err)?);
+
+    let mut second = Vec::with_capacity(first_hex.len() + salt.len());
+    second.extend_from_slice(first_hex.as_bytes());
+    second.extend_from_slice(salt);
+    Ok(hex::encode(hash(MessageDigest::md5(), &second).map_err(map_err)?))
+}
+
+#[cfg(all(feature = "md5-rust-crypto", not(feature = "openssl")))]
+fn md5_password_hash(password: &str, username: &str, salt: &[u8; 4]) -> Result<String, Error> {
+    use md5::{Digest, Md5};
+
+    let mut hasher = Md5::new();
+    hasher.update(password);
+    hasher.update(username);
+    let output = hex::encode(hasher.finalize_reset());
+
+    hasher.update(&output);
+    hasher.update(salt);
+    Ok(hex::encode(hasher.finalize()))
+}
 
 #[derive(Debug)]
 pub enum Password<'a> {
@@ -54,24 +94,7 @@ impl FrontendMessage for Password<'_> {
                 password,
                 salt,
             } => {
-                // The actual `PasswordMessage` can be computed in SQL as
-                // `concat('md5', md5(concat(md5(concat(password, username)), random-salt)))`.
-
-                // Keep in mind the md5() function returns its result as a hex string.
-
-                let mut hasher = Md5::new();
-
-                hasher.update(password);
-                hasher.update(username);
-
-                let mut output = hex::encode(hasher.finalize_reset());
-
-                hasher.update(&output);
-                hasher.update(salt);
-
-                // This is not really optimal but hopefully this is an uncommon code path.
-                // MD5 password hashing should really be phased out anyway.
-                output = hex::encode(hasher.finalize());
+                let mut output = md5_password_hash(password, username, salt)?;
                 output.insert_str(0, "md5");
 
                 buf.put_str_nul(&output);

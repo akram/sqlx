@@ -120,6 +120,11 @@ _sqlite = []
 # database
 any = ["sqlx-core/any", "sqlx-mysql?/any", "sqlx-postgres?/any", "sqlx-sqlite?/any"]
 postgres = ["sqlx-postgres", "sqlx-macros?/postgres"]
+# Route postgres's legacy md5 password-authentication method through
+# OpenSSL instead of the RustCrypto `md-5` crate; `md5-rust-crypto` is the
+# explicit opt-in for the RustCrypto backend. See sqlx-postgres/Cargo.toml.
+openssl = ["sqlx-postgres?/openssl"]
+md5-rust-crypto = ["sqlx-postgres?/md5-rust-crypto"]
 mysql = ["sqlx-mysql", "sqlx-macros?/mysql"]
 mysql-rsa = ["mysql", "sqlx-mysql/rsa", "sqlx-macros?/mysql-rsa"]
 sqlite = ["sqlite-bundled", "sqlite-deserialize", "sqlite-load-extension", "sqlite-unlock-notify"]
@@ -201,6 +206,7 @@ digest = { version = "0.11.2", default-features = false, features = ["alloc"] }
 hkdf = { version = "0.13.0" }
 hmac = { version = "0.13.0", default-features = false }
 md-5 = { version = "0.11.0", default-features = false }
+openssl = { version = "0.10", default-features = false }
 rsa = { version = "0.10.0-rc.18" } # FIXME: when `rsa 0.10` is released
 rand = { version = "0.10.1", features = ["thread_rng"], default-features = false }
 sha1 = { version = "0.11.0", default-features = false }

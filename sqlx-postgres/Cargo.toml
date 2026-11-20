@@ -15,6 +15,18 @@ json = ["dep:serde", "dep:serde_json", "sqlx-core/json"]
 migrate = ["sqlx-core/migrate", "dep:crc"]
 offline = ["json", "sqlx-core/offline", "smallvec/serde"]
 
+# Route the legacy `md5` password-authentication method (PasswordMessage's
+# `Password::Md5` variant, see src/message/password.rs) through system
+# OpenSSL instead of the RustCrypto `md-5` crate, for environments that
+# require all cryptographic operations to go through a FIPS-certifiable
+# OpenSSL build. Does not affect SCRAM-SHA-256 (the modern method, backed
+# by `hmac`/`sha2`, neither of which is affected by this).
+openssl = ["dep:openssl"]
+# Explicit opt-in for the RustCrypto backend of the same code path, not
+# implied by anything else -- a consumer picks this when it wants that
+# backend (as opposed to `openssl`, above).
+md5-rust-crypto = ["dep:md-5"]
+
 # Type Integration features
 bigdecimal = ["dep:bigdecimal", "dep:num-bigint", "sqlx-core/bigdecimal"]
 bit-vec = ["dep:bit-vec", "sqlx-core/bit-vec"]
@@ -36,7 +48,8 @@ futures-util = { version = "0.3.32", default-features = false, features = ["allo
 crc = { workspace = true, optional = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
-md-5 = { workspace = true }
+md-5 = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 
