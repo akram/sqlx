@@ -1,8 +1,6 @@
 use crate::error::Result;
 use crate::Either;
 use crate::PgConnection;
-use hkdf::Hkdf;
-use sha2::Sha256;
 use sqlx_core::executor::Executor;
 use sqlx_core::sql_str::SqlSafeStr;
 use std::ops::{Deref, DerefMut};
@@ -123,25 +121,15 @@ impl PgAdvisoryLock {
         // which should save on codegen and optimization.
 
         // We don't supply a salt as that is intended to be random, but we want a deterministic key.
-        let hkdf = Hkdf::<Sha256>::new(None, input_key_material.as_bytes());
-
-        let mut output_key_material = [0u8; 8];
-
-        // The first string is the "info" string of the HKDF which is intended to tie the output
-        // exclusively to SQLx. This should avoid collisions with implementations using a similar
-        // strategy. If you _want_ this to match some other implementation then you should get
-        // the calculated integer key from it and use that directly.
+        //
+        // The second argument ("info") is intended to tie the output exclusively to SQLx. This
+        // should avoid collisions with implementations using a similar strategy. If you _want_
+        // this to match some other implementation then you should get the calculated integer
+        // key from it and use that directly.
         //
         // Do *not* change this string as it will affect the output!
-        hkdf.expand(
-            b"SQLx (Rust) Postgres advisory lock",
-            &mut output_key_material,
-        )
-        // `Hkdf::expand()` only returns an error if you ask for more than 255 times the digest size.
-        // This is specified by RFC 5869 but not elaborated upon:
-        // https://datatracker.ietf.org/doc/html/rfc5869#section-2.3
-        // Since we're only asking for 8 bytes, this error shouldn't be returned.
-        .expect("BUG: `output_key_material` should be of acceptable length");
+        let output_key_material =
+            hkdf_sha256(input_key_material.as_bytes(), b"SQLx (Rust) Postgres advisory lock");
 
         // For ease of use, this method assumes the user doesn't care which keyspace is used.
         //
@@ -432,4 +420,67 @@ impl<C: AsMut<PgConnection>> Drop for PgAdvisoryLockGuard<C> {
                 .expect("BUG: PgAdvisoryLock::get_release_query() somehow too long for protocol");
         }
     }
+}
+
+/// HKDF-SHA256 (RFC 5869) with no salt (per the RFC, equivalent to a salt of
+/// `HashLen` zero bytes), expanded to 8 bytes of output key material -- well
+/// under SHA-256's 32-byte digest size, so this is always a single HKDF-Expand
+/// block (`T(1)` truncated), never erroring the way a generic HKDF
+/// implementation's `expand()` can for excessive output length.
+#[cfg(feature = "openssl")]
+fn hkdf_sha256(ikm: &[u8], info: &[u8]) -> [u8; 8] {
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::sign::Signer;
+
+    let sign = |key: &[u8], data: &[u8]| -> Vec<u8> {
+        let pkey = PKey::hmac(key)
+            .expect("hmac key is infallible with a correctly installed OpenSSL backend");
+        let mut signer = Signer::new(MessageDigest::sha256(), &pkey)
+            .expect("hmac init is infallible with a correctly installed OpenSSL backend");
+        signer
+            .sign_oneshot_to_vec(data)
+            .expect("hmac sign is infallible with a correctly installed OpenSSL backend")
+    };
+
+    // HKDF-Extract (RFC 5869 2.2): PRK = HMAC-Hash(salt, IKM).
+    let prk = sign(&[0u8; 32], ikm);
+
+    // HKDF-Expand (RFC 5869 2.3): T(1) = HMAC-Hash(PRK, T(0) | info | 0x01), T(0) is empty.
+    let mut t1_input = info.to_vec();
+    t1_input.push(1);
+    let t1 = sign(&prk, &t1_input);
+
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&t1[..8]);
+    out
+}
+
+#[cfg(all(feature = "advisory-lock-rust-crypto", not(feature = "openssl")))]
+fn hkdf_sha256(ikm: &[u8], info: &[u8]) -> [u8; 8] {
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, ikm);
+    let mut out = [0u8; 8];
+    hkdf.expand(info, &mut out)
+        // `Hkdf::expand()` only returns an error if you ask for more than 255 times the digest
+        // size. This is specified by RFC 5869 but not elaborated upon:
+        // https://datatracker.ietf.org/doc/html/rfc5869#section-2.3
+        // Since we're only asking for 8 bytes, this error shouldn't be returned.
+        .expect("BUG: `out` should be of acceptable length");
+    out
+}
+
+/// Neither backend feature is active. This compiles so the crate still
+/// builds in contexts where no consumer forwards a backend choice (e.g.
+/// Cargo's host-only feature-unification bucket for a proc-macro crate's
+/// own dependency, such as sqlx-macros-core's `sqlx-postgres` -- compiled
+/// only to generate code at macro-expansion time, never linked into a
+/// shipped binary). `PgAdvisoryLock::new()` has no `Result` in its
+/// signature (a public API predating this backend split, out of scope to
+/// change here), so unlike the other backend-selected operations in this
+/// crate, there is no graceful way to surface this as an error.
+#[cfg(not(any(feature = "openssl", feature = "advisory-lock-rust-crypto")))]
+fn hkdf_sha256(_ikm: &[u8], _info: &[u8]) -> [u8; 8] {
+    panic!(
+        "PgAdvisoryLock::new() requires the `openssl` or `advisory-lock-rust-crypto` feature"
+    )
 }

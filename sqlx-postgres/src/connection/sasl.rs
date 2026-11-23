@@ -1,10 +1,12 @@
 use crate::connection::stream::PgStream;
 use crate::error::Error;
 use crate::message::{Authentication, AuthenticationSasl, SaslInitialResponse, SaslResponse};
+#[cfg(any(feature = "openssl", feature = "scram-rust-crypto"))]
 use crate::rt;
 use crate::PgConnectOptions;
-use hmac::{Hmac, Mac};
-use hmac::{HmacReset, KeyInit};
+#[cfg(all(feature = "scram-rust-crypto", not(feature = "openssl")))]
+use hmac::{Hmac, HmacReset, KeyInit, Mac};
+#[cfg(all(feature = "scram-rust-crypto", not(feature = "openssl")))]
 use sha2::{Digest, Sha256};
 use stringprep::saslprep;
 
@@ -105,13 +107,10 @@ pub(crate) async fn authenticate(
     let salted_password = hi(&password, &cont.salt, cont.iterations).await?;
 
     // ClientKey := HMAC(SaltedPassword, "Client Key")
-    let mut mac = Hmac::<Sha256>::new_from_slice(&salted_password).map_err(Error::protocol)?;
-    mac.update(b"Client Key");
-
-    let client_key = mac.finalize().into_bytes();
+    let client_key = hmac_sha256(&salted_password, b"Client Key")?;
 
     // StoredKey := H(ClientKey)
-    let stored_key = Sha256::digest(client_key);
+    let stored_key = sha256_digest(&client_key);
 
     // client-final-message-without-proof
     let client_final_message_wo_proof = format!(
@@ -129,10 +128,7 @@ pub(crate) async fn authenticate(
     );
 
     // ClientSignature := HMAC(StoredKey, AuthMessage)
-    let mut mac = Hmac::<Sha256>::new_from_slice(&stored_key).map_err(Error::protocol)?;
-    mac.update(auth_message.as_bytes());
-
-    let client_signature = mac.finalize().into_bytes();
+    let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes())?;
 
     // ClientProof := ClientKey XOR ClientSignature
     let client_proof: Vec<u8> = client_key
@@ -142,14 +138,10 @@ pub(crate) async fn authenticate(
         .collect();
 
     // ServerKey := HMAC(SaltedPassword, "Server Key")
-    let mut mac = Hmac::<Sha256>::new_from_slice(&salted_password).map_err(Error::protocol)?;
-    mac.update(b"Server Key");
-
-    let server_key = mac.finalize().into_bytes();
+    let server_key = hmac_sha256(&salted_password, b"Server Key")?;
 
     // ServerSignature := HMAC(ServerKey, AuthMessage)
-    let mut mac = Hmac::<Sha256>::new_from_slice(&server_key).map_err(Error::protocol)?;
-    mac.update(auth_message.as_bytes());
+    let server_signature = hmac_sha256(&server_key, auth_message.as_bytes())?;
 
     // client-final-message = client-final-message-without-proof "," proof
     let mut client_final_message = format!("{client_final_message_wo_proof},{CLIENT_PROOF_ATTR}=");
@@ -166,7 +158,9 @@ pub(crate) async fn authenticate(
     };
 
     // authentication is only considered valid if this verification passes
-    mac.verify_slice(&data.verifier).map_err(Error::protocol)?;
+    if !constant_time_eq(&server_signature, &data.verifier) {
+        return Err(Error::protocol("SCRAM server signature verification failed"));
+    }
 
     Ok(())
 }
@@ -197,8 +191,119 @@ fn gen_nonce() -> String {
     format!("{NONCE_ATTR}={nonce}")
 }
 
+/// HMAC-SHA256(key, data), one-shot.
+#[cfg(feature = "openssl")]
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], Error> {
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::sign::Signer;
+
+    let pkey = PKey::hmac(key).map_err(Error::protocol)?;
+    let mut signer = Signer::new(MessageDigest::sha256(), &pkey).map_err(Error::protocol)?;
+    let sig = signer.sign_oneshot_to_vec(data).map_err(Error::protocol)?;
+
+    sig.try_into()
+        .map_err(|_| err_protocol!("hmac-sha256 output was not 32 bytes"))
+}
+
+#[cfg(all(feature = "scram-rust-crypto", not(feature = "openssl")))]
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], Error> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(Error::protocol)?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+#[cfg(not(any(feature = "openssl", feature = "scram-rust-crypto")))]
+fn hmac_sha256(_key: &[u8], _data: &[u8]) -> Result<[u8; 32], Error> {
+    Err(Error::Configuration(
+        "postgres SCRAM-SHA-256 authentication requires the `openssl` or `scram-rust-crypto` feature".into(),
+    ))
+}
+
+/// SHA-256(data), one-shot.
+#[cfg(feature = "openssl")]
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), data)
+        .expect("sha256 is infallible with a correctly installed OpenSSL backend");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+#[cfg(all(feature = "scram-rust-crypto", not(feature = "openssl")))]
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
+#[cfg(not(any(feature = "openssl", feature = "scram-rust-crypto")))]
+fn sha256_digest(_data: &[u8]) -> [u8; 32] {
+    unreachable!("unreachable without a SCRAM backend: `hi()` already returns `Err` first")
+}
+
+/// Constant-time comparison, for verifying the server's SCRAM signature.
+#[cfg(feature = "openssl")]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && openssl::memcmp::eq(a, b)
+}
+
+#[cfg(all(feature = "scram-rust-crypto", not(feature = "openssl")))]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
+
+#[cfg(not(any(feature = "openssl", feature = "scram-rust-crypto")))]
+fn constant_time_eq(_a: &[u8], _b: &[u8]) -> bool {
+    unreachable!("unreachable without a SCRAM backend: `hi()` already returns `Err` first")
+}
+
 // Hi(str, salt, i):
-async fn hi<'a>(s: &'a str, salt: &'a [u8], iter_count: u32) -> Result<[u8; 32], Error> {
+//
+// This is PBKDF2-HMAC-SHA256(str, salt, i, dkLen=32) (RFC 8018 5.2's `F`, for block index 1,
+// since the derived key length equals the digest size, i.e. a single block): `U(1) = HMAC(str,
+// salt || INT(1))`, `U(c) = HMAC(str, U(c-1))`, result = `U(1) XOR U(2) XOR ... XOR U(iter_count)`.
+#[cfg(feature = "openssl")]
+async fn hi(s: &str, salt: &[u8], iter_count: u32) -> Result<[u8; 32], Error> {
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::sign::Signer;
+
+    // The loop below yields periodically (same as the RustCrypto version) rather than using
+    // `openssl::pkcs5::pbkdf2_hmac` directly, which would otherwise block the executor for the
+    // whole computation (measured at ~50ms for 4096 iterations, the default, on a developer
+    // machine) with no yield points.
+    let key = PKey::hmac(s.as_bytes()).map_err(Error::protocol)?;
+    let sign = |data: &[u8]| -> Result<[u8; 32], Error> {
+        let mut signer = Signer::new(MessageDigest::sha256(), &key).map_err(Error::protocol)?;
+        let sig = signer.sign_oneshot_to_vec(data).map_err(Error::protocol)?;
+        sig.try_into()
+            .map_err(|_| err_protocol!("hmac-sha256 output was not 32 bytes"))
+    };
+
+    let mut salt_block = Vec::with_capacity(salt.len() + 4);
+    salt_block.extend_from_slice(salt);
+    salt_block.extend_from_slice(&1u32.to_be_bytes());
+
+    let mut u = sign(&salt_block)?;
+    let mut hi = u;
+
+    for i in 1..iter_count {
+        u = sign(&u)?;
+
+        for (h, b) in hi.iter_mut().zip(u.iter()) {
+            *h ^= b;
+        }
+
+        if i % 5 == 0 {
+            rt::yield_now().await;
+        }
+    }
+
+    Ok(hi)
+}
+
+#[cfg(all(feature = "scram-rust-crypto", not(feature = "openssl")))]
+async fn hi(s: &str, salt: &[u8], iter_count: u32) -> Result<[u8; 32], Error> {
     let mut mac = HmacReset::<Sha256>::new_from_slice(s.as_bytes()).map_err(Error::protocol)?;
 
     mac.update(salt);
@@ -222,4 +327,91 @@ async fn hi<'a>(s: &'a str, salt: &'a [u8], iter_count: u32) -> Result<[u8; 32],
     }
 
     Ok(hi.into())
+}
+
+/// Neither backend feature is active. This compiles so the crate still
+/// builds in contexts where no consumer forwards a backend choice (e.g.
+/// Cargo's host-only feature-unification bucket for a proc-macro crate's
+/// own dependency, such as sqlx-macros-core's `sqlx-postgres` -- compiled
+/// only to generate code at macro-expansion time, never linked into a
+/// shipped binary, so this arm is unreachable in practice for a consumer
+/// that, like `sqlx` itself here, forwards one of the two features for
+/// its real target build).
+#[cfg(not(any(feature = "openssl", feature = "scram-rust-crypto")))]
+async fn hi(_s: &str, _salt: &[u8], _iter_count: u32) -> Result<[u8; 32], Error> {
+    Err(Error::Configuration(
+        "postgres SCRAM-SHA-256 authentication requires the `openssl` or `scram-rust-crypto` feature".into(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Independent reference implementation of `hi()`'s PBKDF2-HMAC-SHA256,
+    // written directly against RustCrypto rather than calling this module's
+    // own `hi()` (whichever backend that resolves to), so a bug shared
+    // between the two wouldn't go unnoticed.
+    fn reference_hi(s: &str, salt: &[u8], iter_count: u32) -> [u8; 32] {
+        use ::hmac::{Hmac, KeyInit, Mac};
+        use ::sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(s.as_bytes()).unwrap();
+        mac.update(salt);
+        mac.update(&1u32.to_be_bytes());
+        let mut u: [u8; 32] = mac.finalize().into_bytes().into();
+        let mut hi = u;
+
+        for _ in 1..iter_count {
+            let mut mac = Hmac::<Sha256>::new_from_slice(s.as_bytes()).unwrap();
+            mac.update(&u);
+            u = mac.finalize().into_bytes().into();
+            for (h, b) in hi.iter_mut().zip(u.iter()) {
+                *h ^= b;
+            }
+        }
+
+        hi
+    }
+
+    #[test]
+    fn hi_matches_reference_implementation() {
+        futures_executor::block_on(async {
+            for iterations in [1, 2, 5, 11, 4096] {
+                let got = hi("correct-password", b"some-random-salt", iterations)
+                    .await
+                    .unwrap();
+                let want = reference_hi("correct-password", b"some-random-salt", iterations);
+                assert_eq!(got, want, "mismatch at {iterations} iterations");
+            }
+        });
+    }
+
+    #[test]
+    fn hmac_sha256_matches_reference() {
+        use ::hmac::{Hmac, KeyInit, Mac};
+        use ::sha2::Sha256;
+
+        let got = hmac_sha256(b"Client Key", b"some auth message").unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"Client Key").unwrap();
+        mac.update(b"some auth message");
+        let want: [u8; 32] = mac.finalize().into_bytes().into();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn sha256_digest_matches_reference() {
+        use ::sha2::{Digest, Sha256};
+
+        let got = sha256_digest(b"some client key");
+        let want: [u8; 32] = Sha256::digest(b"some client key").into();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn constant_time_eq_self_consistent() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
 }

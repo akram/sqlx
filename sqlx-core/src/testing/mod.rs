@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 pub use fixtures::FixtureSnapshot;
+#[cfg(all(feature = "digest-rust-crypto", not(feature = "openssl")))]
 use sha2::{Digest, Sha512};
 
 use crate::connection::{ConnectOptions, Connection};
@@ -13,6 +14,31 @@ use crate::migrate::{Migrate, Migrator};
 use crate::pool::{Pool, PoolConnection, PoolOptions};
 
 mod fixtures;
+
+/// SHA-512(data), one-shot, for deterministic test-database name generation
+/// ([`TestSupport::db_name`]) -- not a security-sensitive use (it's a
+/// collision-avoidance namespacing scheme, not an authentication or
+/// confidentiality mechanism), but still backend-selectable like every
+/// other digest usage in this crate.
+#[cfg(feature = "openssl")]
+fn sha512_digest(data: &[u8]) -> Vec<u8> {
+    openssl::hash::hash(openssl::hash::MessageDigest::sha512(), data)
+        .expect("sha512 is infallible with a correctly installed OpenSSL backend")
+        .to_vec()
+}
+
+#[cfg(all(feature = "digest-rust-crypto", not(feature = "openssl")))]
+fn sha512_digest(data: &[u8]) -> Vec<u8> {
+    Sha512::digest(data).to_vec()
+}
+
+/// Neither backend feature is active. See the equivalent arm in
+/// sqlx-postgres/src/connection/sasl.rs for why this compiles rather than
+/// being omitted.
+#[cfg(not(any(feature = "openssl", feature = "digest-rust-crypto")))]
+fn sha512_digest(_data: &[u8]) -> Vec<u8> {
+    panic!("TestSupport::db_name() requires the `openssl` or `digest-rust-crypto` feature")
+}
 
 pub trait TestSupport: Database {
     /// Get parameters to construct a `Pool` suitable for testing.
@@ -47,9 +73,7 @@ pub trait TestSupport: Database {
 
     /// Generate a unique database name for the given test path.
     fn db_name(args: &TestArgs) -> String {
-        let mut hasher = Sha512::new();
-        hasher.update(args.test_path.as_bytes());
-        let hash = hasher.finalize();
+        let hash = sha512_digest(args.test_path.as_bytes());
         let hash = URL_SAFE.encode(&hash[..39]);
         let db_name = format!("_sqlx_test_{}", hash).replace('-', "_");
         debug_assert!(db_name.len() == 63);

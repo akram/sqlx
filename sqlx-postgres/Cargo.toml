@@ -16,16 +16,19 @@ migrate = ["sqlx-core/migrate", "dep:crc"]
 offline = ["json", "sqlx-core/offline", "smallvec/serde"]
 
 # Route the legacy `md5` password-authentication method (PasswordMessage's
-# `Password::Md5` variant, see src/message/password.rs) through system
-# OpenSSL instead of the RustCrypto `md-5` crate, for environments that
-# require all cryptographic operations to go through a FIPS-certifiable
-# OpenSSL build. Does not affect SCRAM-SHA-256 (the modern method, backed
-# by `hmac`/`sha2`, neither of which is affected by this).
+# `Password::Md5` variant, see src/message/password.rs), SCRAM-SHA-256
+# (the modern SASL method, see src/connection/sasl.rs), and the advisory-
+# lock key derivation (HKDF-SHA256, see src/advisory_lock.rs) through
+# system OpenSSL instead of the RustCrypto `md-5`/`hmac`/`sha2`/`hkdf`
+# crates, for environments that require all cryptographic operations to
+# go through a FIPS-certifiable OpenSSL build.
 openssl = ["dep:openssl"]
-# Explicit opt-in for the RustCrypto backend of the same code path, not
-# implied by anything else -- a consumer picks this when it wants that
+# Explicit opt-in for the RustCrypto backend of the same code paths, not
+# implied by anything else -- a consumer picks these when it wants that
 # backend (as opposed to `openssl`, above).
 md5-rust-crypto = ["dep:md-5"]
+scram-rust-crypto = ["dep:hmac", "dep:sha2", "dep:subtle"]
+advisory-lock-rust-crypto = ["dep:hkdf", "dep:sha2"]
 
 # Type Integration features
 bigdecimal = ["dep:bigdecimal", "dep:num-bigint", "sqlx-core/bigdecimal"]
@@ -46,12 +49,17 @@ futures-util = { version = "0.3.32", default-features = false, features = ["allo
 
 # Cryptographic Primitives
 crc = { workspace = true, optional = true }
-hkdf = { workspace = true }
-hmac = { workspace = true }
+hkdf = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
 rand = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, optional = true }
+# Constant-time comparison for SCRAM-SHA-256's server-signature check, on
+# the RustCrypto backend only (the `openssl` backend uses
+# `openssl::memcmp::eq` instead). Not a cryptographic primitive itself, so
+# it isn't backend-selected.
+subtle = { version = "2", optional = true }
 
 # Type Integrations (versions inherited from `[workspace.dependencies]`)
 bigdecimal = { workspace = true, optional = true }
@@ -96,6 +104,15 @@ features = ["postgres", "derive"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 etcetera = "0.11.0"
+
+[dev-dependencies]
+# Cross-checked against the SCRAM-SHA-256 (sasl.rs) and advisory-lock
+# (advisory_lock.rs) OpenSSL implementations' own tests, regardless of
+# which release feature set is active; never shipped (dev-only).
+hmac.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+futures-executor = "0.3"
 
 [lints]
 workspace = true

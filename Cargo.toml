@@ -120,11 +120,22 @@ _sqlite = []
 # database
 any = ["sqlx-core/any", "sqlx-mysql?/any", "sqlx-postgres?/any", "sqlx-sqlite?/any"]
 postgres = ["sqlx-postgres", "sqlx-macros?/postgres"]
-# Route postgres's legacy md5 password-authentication method through
-# OpenSSL instead of the RustCrypto `md-5` crate; `md5-rust-crypto` is the
-# explicit opt-in for the RustCrypto backend. See sqlx-postgres/Cargo.toml.
-openssl = ["sqlx-postgres?/openssl"]
+# Route postgres's legacy md5 password-authentication method, SCRAM-SHA-256,
+# and the advisory-lock key derivation through OpenSSL instead of the
+# RustCrypto `md-5`/`hmac`/`sha2`/`hkdf` crates; the `*-rust-crypto`
+# features are the explicit opt-in for the RustCrypto backend of each. See
+# sqlx-postgres/Cargo.toml.
+openssl = ["sqlx-postgres?/openssl", "sqlx-core/openssl", "sqlx-macros?/openssl"]
 md5-rust-crypto = ["sqlx-postgres?/md5-rust-crypto"]
+scram-rust-crypto = ["sqlx-postgres?/scram-rust-crypto"]
+advisory-lock-rust-crypto = ["sqlx-postgres?/advisory-lock-rust-crypto"]
+# sqlx-core's own direct digest usage (migration checksums, the test
+# harness's database-name hashing) is independent of sqlx-postgres and of
+# the `migrate` feature (the latter is unconditionally compiled); the
+# query-data cache fingerprint (sqlx-macros-core, via sqlx-macros) is a
+# third, also-independent digest usage, but shares this same RustCrypto
+# opt-in. See sqlx-core/Cargo.toml and sqlx-macros-core/Cargo.toml.
+digest-rust-crypto = ["sqlx-core/digest-rust-crypto", "sqlx-macros?/digest-rust-crypto"]
 mysql = ["sqlx-mysql", "sqlx-macros?/mysql"]
 mysql-rsa = ["mysql", "sqlx-mysql/rsa", "sqlx-macros?/mysql-rsa"]
 sqlite = ["sqlite-bundled", "sqlite-deserialize", "sqlite-load-extension", "sqlite-unlock-notify"]

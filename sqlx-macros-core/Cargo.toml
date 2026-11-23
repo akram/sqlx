@@ -11,6 +11,30 @@ rust-version.workspace = true
 [features]
 default = []
 
+# Routes the query-data cache fingerprint (query/data.rs, computed at
+# macro-expansion time, never shipped) through system OpenSSL instead of
+# the RustCrypto `sha2` crate, for environments that require all
+# cryptographic operations -- including build-time-only ones a FIPS
+# scanner's dependency-graph check still inspects -- to go through a
+# FIPS-certifiable OpenSSL build. `digest-rust-crypto` is the explicit
+# opt-in for the RustCrypto backend.
+# Also forwards to sqlx-core's own instance of these features: that crate
+# is a dependency of this one regardless of `migrate` (its `testing`
+# module, unconditionally compiled, has the same digest-backend need), and
+# the `migrate` feature below additionally needs it for migration-checksum
+# computation inside the `migrate!` macro's expansion. Also forwards to
+# sqlx-postgres (SCRAM-SHA-256 and the advisory-lock key derivation),
+# needed when `query!`/`query_as!` connect to a live Postgres database at
+# macro-expansion time (not needed in `offline`/`sqlx-toml`-cached mode,
+# but this crate can't tell which mode a consumer will actually use).
+openssl = ["dep:openssl", "sqlx-core/openssl", "sqlx-postgres?/openssl"]
+digest-rust-crypto = [
+    "dep:sha2",
+    "sqlx-core/digest-rust-crypto",
+    "sqlx-postgres?/scram-rust-crypto",
+    "sqlx-postgres?/advisory-lock-rust-crypto",
+]
+
 # for conditional compilation
 _rt-async-global-executor = ["async-global-executor", "sqlx-core/_rt-async-global-executor"]
 _rt-async-std = ["async-std", "sqlx-core/_rt-async-std"]
@@ -73,9 +97,10 @@ hex = { version = "0.4.3" }
 heck = { version = "0.5" }
 either = "1.6.1"
 proc-macro2 = { version = "1.0.83", default-features = false }
+openssl = { version = "0.10", optional = true }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.142" }
-sha2 = { version = "0.11.0" }
+sha2 = { version = "0.11.0", optional = true }
 syn = { version = "2.0.87", default-features = false, features = ["full", "derive", "parsing", "printing", "clone-impls"] }
 quote = { version = "1.0.35", default-features = false }
 url = { version = "2.2.2" }

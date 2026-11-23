@@ -13,7 +13,15 @@ features = ["offline"]
 
 [features]
 default = []
-migrate = ["sha2", "crc"]
+migrate = ["crc"]
+# Routes migration-checksum hashing (migrate/migration.rs) and the test
+# harness's database-name hashing (testing/mod.rs, unconditionally compiled,
+# independent of `migrate`) through system OpenSSL instead of the
+# RustCrypto `sha2` crate, for environments that require all cryptographic
+# operations to go through a FIPS-certifiable OpenSSL build.
+# `digest-rust-crypto` is the explicit opt-in for the RustCrypto backend.
+openssl = ["dep:openssl"]
+digest-rust-crypto = ["dep:sha2"]
 
 any = []
 
@@ -87,6 +95,7 @@ futures-intrusive = "0.5.0"
 futures-util = { version = "0.3.32", default-features = false, features = ["alloc", "sink", "io"] }
 log = { version = "0.4.18", default-features = false }
 memchr = { version = "2.5.0", default-features = false }
+openssl = { version = "0.10", optional = true }
 percent-encoding = "2.3.0"
 serde = { version = "1.0.219", features = ["derive", "rc"], optional = true }
 serde_json = { version = "1.0.142", features = ["raw_value"], optional = true }

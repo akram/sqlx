@@ -206,9 +206,29 @@ where
     }
 }
 
+// Not a security-sensitive use of SHA-256 (it's a cache-key fingerprint for the query-data
+// file, computed at macro-expansion time, never shipped in a built binary), but still
+// backend-selectable like every other digest usage in this fork, since it's still what pulls
+// the RustCrypto `sha2` crate into the build-time dependency graph a FIPS scanner inspects.
+#[cfg(feature = "openssl")]
+pub(super) fn hash_string(query: &str) -> String {
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), query.as_bytes())
+        .expect("sha256 is infallible with a correctly installed OpenSSL backend");
+    hex::encode(digest)
+}
+
+#[cfg(all(feature = "digest-rust-crypto", not(feature = "openssl")))]
 pub(super) fn hash_string(query: &str) -> String {
     // picked `sha2` because it's already in the dependency tree for both MySQL and Postgres
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(query.as_bytes()))
+}
+
+/// Neither backend feature is active. See the equivalent arm in
+/// sqlx-postgres/src/connection/sasl.rs for why this compiles rather than
+/// being omitted.
+#[cfg(not(any(feature = "openssl", feature = "digest-rust-crypto")))]
+pub(super) fn hash_string(_query: &str) -> String {
+    panic!("sqlx's query-data cache fingerprint requires the `openssl` or `digest-rust-crypto` feature")
 }

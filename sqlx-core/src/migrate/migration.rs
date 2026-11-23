@@ -1,3 +1,4 @@
+#[cfg(all(feature = "digest-rust-crypto", not(feature = "openssl")))]
 use sha2::{Digest, Sha384};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -84,9 +85,29 @@ pub struct AppliedMigration {
 }
 
 pub fn checksum(sql: &str) -> Vec<u8> {
-    Sha384::digest(sql).to_vec()
+    checksum_fragments(std::iter::once(sql))
 }
 
+#[cfg(feature = "openssl")]
+pub fn checksum_fragments<'a>(fragments: impl Iterator<Item = &'a str>) -> Vec<u8> {
+    use openssl::hash::{Hasher, MessageDigest};
+
+    let mut hasher = Hasher::new(MessageDigest::sha384())
+        .expect("hasher init is infallible with a correctly installed OpenSSL backend");
+
+    for fragment in fragments {
+        hasher
+            .update(fragment.as_bytes())
+            .expect("hasher update is infallible with a correctly installed OpenSSL backend");
+    }
+
+    hasher
+        .finish()
+        .expect("hasher finish is infallible with a correctly installed OpenSSL backend")
+        .to_vec()
+}
+
+#[cfg(all(feature = "digest-rust-crypto", not(feature = "openssl")))]
 pub fn checksum_fragments<'a>(fragments: impl Iterator<Item = &'a str>) -> Vec<u8> {
     let mut digest = Sha384::new();
 
@@ -95,6 +116,14 @@ pub fn checksum_fragments<'a>(fragments: impl Iterator<Item = &'a str>) -> Vec<u
     }
 
     digest.finalize().to_vec()
+}
+
+/// Neither backend feature is active. See the equivalent arm in
+/// sqlx-postgres/src/connection/sasl.rs for why this compiles rather than
+/// being omitted.
+#[cfg(not(any(feature = "openssl", feature = "digest-rust-crypto")))]
+pub fn checksum_fragments<'a>(_fragments: impl Iterator<Item = &'a str>) -> Vec<u8> {
+    panic!("sqlx migration checksums require the `openssl` or `digest-rust-crypto` feature")
 }
 
 #[test]
