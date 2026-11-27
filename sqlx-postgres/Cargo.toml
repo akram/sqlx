@@ -18,11 +18,12 @@ offline = ["json", "sqlx-core/offline", "smallvec/serde"]
 # Route the legacy `md5` password-authentication method (PasswordMessage's
 # `Password::Md5` variant, see src/message/password.rs), SCRAM-SHA-256
 # (the modern SASL method, see src/connection/sasl.rs), and the advisory-
-# lock key derivation (HKDF-SHA256, see src/advisory_lock.rs) through
-# system OpenSSL instead of the RustCrypto `md-5`/`hmac`/`sha2`/`hkdf`
-# crates, for environments that require all cryptographic operations to
-# go through a FIPS-certifiable OpenSSL build.
-openssl = ["dep:openssl"]
+# lock key derivation (HKDF-SHA256 via OpenSSL's own EVP_KDF-HKDF, see
+# src/advisory_lock.rs) through system OpenSSL instead of the RustCrypto
+# `md-5`/`hmac`/`sha2`/`hkdf` crates, for environments that require all
+# cryptographic operations to go through a FIPS-certifiable OpenSSL build.
+# The EVP_KDF provider API requires OpenSSL 3.x.
+openssl = ["dep:openssl", "dep:openssl-sys"]
 # Explicit opt-in for the RustCrypto backend of the same code paths, not
 # implied by anything else -- a consumer picks these when it wants that
 # backend (as opposed to `openssl`, above).
@@ -53,6 +54,12 @@ hkdf = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 openssl = { workspace = true, optional = true }
+# Direct FFI for the EVP_KDF provider API (HKDF) used by the `openssl`
+# backend's advisory-lock key derivation: the `openssl` crate doesn't wrap
+# EVP_KDF, and doesn't re-export `openssl-sys` either. Resolves to the same
+# openssl-sys instance as `openssl` itself (same version requirement range),
+# so there's no second libcrypto binding in the build.
+openssl-sys = { workspace = true, optional = true }
 rand = { workspace = true }
 sha2 = { workspace = true, optional = true }
 # Constant-time comparison for SCRAM-SHA-256's server-signature check, on

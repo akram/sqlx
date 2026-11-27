@@ -128,8 +128,10 @@ impl PgAdvisoryLock {
         // key from it and use that directly.
         //
         // Do *not* change this string as it will affect the output!
-        let output_key_material =
-            hkdf_sha256(input_key_material.as_bytes(), b"SQLx (Rust) Postgres advisory lock");
+        let output_key_material = hkdf_sha256(
+            input_key_material.as_bytes(),
+            b"SQLx (Rust) Postgres advisory lock",
+        );
 
         // For ease of use, this method assumes the user doesn't care which keyspace is used.
         //
@@ -427,32 +429,82 @@ impl<C: AsMut<PgConnection>> Drop for PgAdvisoryLockGuard<C> {
 /// under SHA-256's 32-byte digest size, so this is always a single HKDF-Expand
 /// block (`T(1)` truncated), never erroring the way a generic HKDF
 /// implementation's `expand()` can for excessive output length.
+///
+/// Goes through OpenSSL's own `EVP_KDF-HKDF` (default and FIPS providers)
+/// rather than composing HKDF-Extract/Expand out of raw HMAC calls: FIPS
+/// requires keying material to come out of the crypto module's own KDF. The
+/// salt is passed explicitly as 32 zero bytes so the derivation is bit-for-bit
+/// what RFC 5869's "no salt" case (and the `advisory-lock-rust-crypto`
+/// backend's `Hkdf::new(None, ..)`) specifies -- advisory lock keys must stay
+/// stable across backends, which the `PgAdvisoryLock::new` doctest and the
+/// differential test below pin. Requires OpenSSL 3.x (the EVP_KDF provider
+/// API does not exist in 1.1).
 #[cfg(feature = "openssl")]
 fn hkdf_sha256(ikm: &[u8], info: &[u8]) -> [u8; 8] {
-    use openssl::hash::MessageDigest;
-    use openssl::pkey::PKey;
-    use openssl::sign::Signer;
+    use std::ffi::c_char;
 
-    let sign = |key: &[u8], data: &[u8]| -> Vec<u8> {
-        let pkey = PKey::hmac(key)
-            .expect("hmac key is infallible with a correctly installed OpenSSL backend");
-        let mut signer = Signer::new(MessageDigest::sha256(), &pkey)
-            .expect("hmac init is infallible with a correctly installed OpenSSL backend");
-        signer
-            .sign_oneshot_to_vec(data)
-            .expect("hmac sign is infallible with a correctly installed OpenSSL backend")
-    };
+    use openssl_sys as ffi;
 
-    // HKDF-Extract (RFC 5869 2.2): PRK = HMAC-Hash(salt, IKM).
-    let prk = sign(&[0u8; 32], ikm);
-
-    // HKDF-Expand (RFC 5869 2.3): T(1) = HMAC-Hash(PRK, T(0) | info | 0x01), T(0) is empty.
-    let mut t1_input = info.to_vec();
-    t1_input.push(1);
-    let t1 = sign(&prk, &t1_input);
+    // openssl-sys binds the EVP_KDF entry points and the octet-string
+    // OSSL_PARAM constructors, but not `OSSL_PARAM_construct_utf8_string`;
+    // the "digest" and "mode" parameters are UTF-8 strings, so bind that one
+    // constructor here. It is exported by the same libcrypto the `openssl`
+    // crate already links against (OpenSSL 3.x, see the doc comment above).
+    unsafe extern "C" {
+        fn OSSL_PARAM_construct_utf8_string(
+            key: *const c_char,
+            buf: *mut c_char,
+            bsize: usize,
+        ) -> ffi::OSSL_PARAM;
+    }
 
     let mut out = [0u8; 8];
-    out.copy_from_slice(&t1[..8]);
+    // RFC 5869's "no salt" is a salt of HashLen (32) zero bytes; pass it
+    // explicitly instead of relying on the provider's default.
+    let salt = [0u8; 32];
+    // NUL-terminated copies for the UTF-8 string params; the size handed to
+    // the constructor excludes the NUL byte, matching what
+    // OSSL_PARAM_BLD_push_utf8_string produces.
+    let mut digest_buf = [0u8; 7];
+    digest_buf[..6].copy_from_slice(b"SHA256");
+    let mut mode_buf = [0u8; 19];
+    mode_buf[..18].copy_from_slice(b"EXTRACT_AND_EXPAND");
+
+    unsafe {
+        let method = ffi::EVP_KDF_fetch(std::ptr::null_mut(), c"HKDF".as_ptr(), std::ptr::null());
+        assert!(
+            !method.is_null(),
+            "EVP_KDF_fetch(HKDF) failed: OpenSSL 3.x is required for the openssl backend"
+        );
+        let ctx = ffi::EVP_KDF_CTX_new(method);
+        assert!(!ctx.is_null(), "EVP_KDF_CTX_new failed for the HKDF method");
+
+        let params = [
+            OSSL_PARAM_construct_utf8_string(c"digest".as_ptr(), digest_buf.as_mut_ptr().cast(), 6),
+            ffi::OSSL_PARAM_construct_octet_string(
+                c"salt".as_ptr(),
+                salt.as_ptr().cast_mut().cast(),
+                salt.len(),
+            ),
+            ffi::OSSL_PARAM_construct_octet_string(
+                c"key".as_ptr(),
+                ikm.as_ptr().cast_mut().cast(),
+                ikm.len(),
+            ),
+            ffi::OSSL_PARAM_construct_octet_string(
+                c"info".as_ptr(),
+                info.as_ptr().cast_mut().cast(),
+                info.len(),
+            ),
+            OSSL_PARAM_construct_utf8_string(c"mode".as_ptr(), mode_buf.as_mut_ptr().cast(), 18),
+            ffi::OSSL_PARAM_construct_end(),
+        ];
+
+        let ok = ffi::EVP_KDF_derive(ctx, out.as_mut_ptr(), out.len(), params.as_ptr());
+        ffi::EVP_KDF_CTX_free(ctx);
+        ffi::EVP_KDF_free(method);
+        assert!(ok == 1, "EVP_KDF_derive(HKDF, 8 bytes) failed");
+    }
     out
 }
 
@@ -480,7 +532,50 @@ fn hkdf_sha256(ikm: &[u8], info: &[u8]) -> [u8; 8] {
 /// crate, there is no graceful way to surface this as an error.
 #[cfg(not(any(feature = "openssl", feature = "advisory-lock-rust-crypto")))]
 fn hkdf_sha256(_ikm: &[u8], _info: &[u8]) -> [u8; 8] {
-    panic!(
-        "PgAdvisoryLock::new() requires the `openssl` or `advisory-lock-rust-crypto` feature"
-    )
+    panic!("PgAdvisoryLock::new() requires the `openssl` or `advisory-lock-rust-crypto` feature")
+}
+
+#[cfg(all(test, feature = "openssl", feature = "advisory-lock-rust-crypto"))]
+mod hkdf_tests {
+    use super::hkdf_sha256;
+
+    /// The two backends must agree bit-for-bit: advisory lock keys derived
+    /// from the same string have to be identical regardless of which crypto
+    /// backend the binary was compiled with, or the same lock name would map
+    /// to different keys in different builds. `PgAdvisoryLock::new`'s doctest
+    /// pins one production value; this sweeps the input space (including the
+    /// RFC 5869 edge cases of empty IKM and empty info) against the
+    /// RustCrypto `hkdf` crate's own implementation.
+    #[test]
+    fn openssl_hkdf_matches_rust_crypto() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (
+                b"my first Postgres advisory lock!",
+                b"SQLx (Rust) Postgres advisory lock",
+            ),
+            (b"", b"SQLx (Rust) Postgres advisory lock"),
+            (b"s", b""),
+            (b"", b"info"),
+            (
+                &[0x0b; 22],
+                &[0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9],
+            ),
+            (&[0x42u8; 512], &[0x99u8; 512]),
+        ];
+
+        for &(ikm, info) in cases {
+            let openssl_out = hkdf_sha256(ikm, info);
+            let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, ikm);
+            let mut rust_crypto_out = [0u8; 8];
+            hkdf.expand(info, &mut rust_crypto_out)
+                .expect("8 bytes is always a valid HKDF output length");
+            assert_eq!(
+                openssl_out,
+                rust_crypto_out,
+                "EVP_KDF-HKDF diverged from the RustCrypto hkdf crate for ikm len {}, info len {}",
+                ikm.len(),
+                info.len()
+            );
+        }
+    }
 }
