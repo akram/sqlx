@@ -27,7 +27,9 @@ fn md5_password_hash(password: &str, username: &str, salt: &[u8; 4]) -> Result<S
     let mut second = Vec::with_capacity(first_hex.len() + salt.len());
     second.extend_from_slice(first_hex.as_bytes());
     second.extend_from_slice(salt);
-    Ok(hex::encode(hash(MessageDigest::md5(), &second).map_err(map_err)?))
+    Ok(hex::encode(
+        hash(MessageDigest::md5(), &second).map_err(map_err)?,
+    ))
 }
 
 #[cfg(all(feature = "md5-rust-crypto", not(feature = "openssl")))]
@@ -55,7 +57,8 @@ fn md5_password_hash(password: &str, username: &str, salt: &[u8; 4]) -> Result<S
 #[cfg(not(any(feature = "openssl", feature = "md5-rust-crypto")))]
 fn md5_password_hash(_password: &str, _username: &str, _salt: &[u8; 4]) -> Result<String, Error> {
     Err(Error::Configuration(
-        "postgres md5 password authentication requires the `openssl` or `md5-rust-crypto` feature".into(),
+        "postgres md5 password authentication requires the `openssl` or `md5-rust-crypto` feature"
+            .into(),
     ))
 }
 

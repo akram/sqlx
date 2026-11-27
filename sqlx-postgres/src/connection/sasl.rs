@@ -159,7 +159,9 @@ pub(crate) async fn authenticate(
 
     // authentication is only considered valid if this verification passes
     if !constant_time_eq(&server_signature, &data.verifier) {
-        return Err(Error::protocol("SCRAM server signature verification failed"));
+        return Err(Error::protocol(
+            "SCRAM server signature verification failed",
+        ));
     }
 
     Ok(())
